@@ -1,0 +1,69 @@
+#!/bin/bash
+
+#
+# Simples script de backup para PostgreSQL
+#
+
+# Com a rotatividade dos snapshots do ZFS, teremos mais do que 10 dias...
+backupDays=10
+
+# Credenciais
+pg_host="127.0.0.1"
+pg_port="$1"
+pg_user=""
+pg_passwd=""
+
+# Destino do backup
+pg_backup_dir="/opt/backup/postgresql/${pg_host}_${pg_port}"
+
+# Numero de jobs para o pg_dump (recomendado (total_cores/2)-2), 0 para nao dividir
+total_jobs="$2"
+[[ -z "$2" ]] && total_jobs=0
+
+##########
+
+# Sem um primeiro argumento, sairemos.
+if [[ -z "$1" ]]; then
+    echo -e "Usage: $(basename $0) <port> [jobs=0]"
+    exit
+fi
+
+# Numero deste backup
+num=$(( `date +%-d` % $backupDays ))
+
+if [[ $total_jobs -gt 0 ]]; then
+    pg_dump_extra_args="-j $total_jobs -Fd"
+    pg_dump_extension="pgdf"
+else
+    pg_dump_extra_args="-Fd"
+    pg_dump_extension="pgdf"
+fi
+
+trap "rm -f /tmp/.pgdblist.$$ &>/dev/null" EXIT INT
+
+export PGPASSWORD=${pg_pass}
+
+cd /tmp &>/dev/null
+mkdir -p "${pg_backup_dir}" &>/dev/null
+
+echo "=> [`date +%Y-%m-%d_%H:%M:%S`] Criando backup numero $num do rotativo de $backupDays backups."
+chown postgres:postgres "${pg_backup_dir}" &>/dev/null
+
+echo -e "=> [`date +%Y-%m-%d_%H:%M:%S`] Backuping schema..."
+pg_dumpall -h $pg_host -p $pg_port -U $pg_user -s | gzip >${pg_backup_dir}/postgresql_${num}_schema.${pg_dump_extension}.sql.gz
+
+echo -e "=> [`date +%Y-%m-%d_%H:%M:%S`] Backuping roles..."
+pg_dumpall -h $pg_host -p $pg_port -U $pg_user -r | gzip >${pg_backup_dir}/postgresql_${num}_roles.${pg_dump_extension}.sql.gz
+
+# Se tivermos um terceiro argumento qualquer, iremos sair, sinal que iriamos fazer backup somente dos principais metadados
+#[[ ! -z "$3" ]] && exit
+psql -h $pg_host -p $pg_port -U $pg_user -A -q -t -c 'SELECT datname FROM pg_database;' postgres >/tmp/.pgdblist.$$
+
+for db in $(cat /tmp/.pgdblist.$$ | grep -v -E '^template|^postgres')
+do
+    echo -e "=> [`date +%Y-%m-%d_%H:%M:%S`] Backuping $db..."
+    [[ $total_jobs -gt 0 ]] && ( mv -f "${pg_backup_dir}/postgresql_${num}_${db}.${pg_dump_extension}" "${pg_backup_dir}/postgresql_${num}_${db}.${pg_dump_extension}.old" &>/dev/null; mkdir -p "${pg_backup_dir}/postgresql_${num}_${db}.${pg_dump_extension}"; chown postgres:postgres "${pg_backup_dir}/postgresql_${num}_${db}.${pg_dump_extension}" )
+    pg_dump -h $pg_host -p $pg_port -U $pg_user $pg_dump_extra_args -f ${pg_backup_dir}/postgresql_${num}_${db}.${pg_dump_extension} $db && rm -rf ${pg_backup_dir}/postgresql_${num}_${db}.${pg_dump_extension}.old
+done
+echo "$num" >"${pg_backup_dir}/postgresql.${pg_dump_extension}.latest"
+echo "=> [`date +%Y-%m-%d_%H:%M:%S`] Backup concluido."
